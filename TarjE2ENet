@@ -1,0 +1,275 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Thu May 23 20:58:24 2024
+
+@author: HP
+"""
+
+import tensorflow as tf
+from tensorflow import keras
+import numpy as np
+import pandas as pd
+from matplotlib import pyplot as plt
+import random
+from math import sqrt, pi
+
+gpus = tf.config.experimental.list_physical_devices('GPU')
+tf.config.experimental.set_memory_growth(gpus[0],True)
+
+class Trajectory_information_Encoder(keras.models.Model):
+    def __init__(self, units=128):
+        super().__init__()
+        self.pre_k = pre_k
+        self.units = units
+        self.logits, self.logits_= {}, {}
+        self.MHAttention = keras.layers.MultiHeadAttention(num_heads=8, key_dim=2)
+        self.attention_diff = keras.layers.Attention()
+        self.lstm = keras.layers.LSTM(units, return_sequences=True#, return_state=True
+                                        , activity_regularizer=tf.keras.regularizers.l2(0.001)
+                                        , kernel_regularizer=tf.keras.regularizers.l2(0.001)
+                                        )        
+        self.lstm1 = keras.layers.LSTM(units, return_sequences=True#, return_state=True
+                                        , activity_regularizer=tf.keras.regularizers.l2(0.001)
+                                        , kernel_regularizer=tf.keras.regularizers.l2(0.001)
+                                        )        
+        self.lstm_diff_ = keras.layers.LSTMCell(units, name='diff' #return_sequences=True, return_state=True,  
+                                        , activity_regularizer=tf.keras.regularizers.l2(0.001)
+                                        , kernel_regularizer=tf.keras.regularizers.l2(0.001)
+                                        )       
+        self.lstm_all_ = keras.layers.LSTMCell(units=128, name='all'
+                                        , activity_regularizer=tf.keras.regularizers.l2(0.001) 
+                                        , kernel_regularizer=tf.keras.regularizers.l2(0.001)
+                                        )
+        self.layernorm1 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+        self.layernorm3 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+          
+        self.dense0 = keras.layers.Dense(units=128)
+        self.dense1 = keras.layers.Dense(units=128)
+        self.dense2 = keras.layers.Dense(units=128)
+        self.dense_ = keras.layers.Dense(units=128)
+        self.dense_diff = keras.layers.Dense(units=64)
+        self.dense_h_all = keras.layers.Dense(units=64)
+        
+    def call(self, inputs, inputs_, input_diff):
+        
+        encoder_out_ = []
+        for m in range(int(inputs_.shape[-1] / 5)):
+            inu = inputs_[:,:,m*2:(m+1)*2] 
+            encoder_output_ = self.lstm1(inu) #, state_h2, state_c2
+            encoder_output_ = self.dense1(encoder_output_)
+            encoder_out_.append(encoder_output_)
+        encoder_output_ = tf.keras.backend.sum(encoder_out_, axis=0) / (m+1)
+
+        inputs = self.dense0(inputs)
+        encoder_output = self.lstm(inputs)
+        # diff_output, states_diff = self.lstm_diff_(input_diff)
+        concat_around = keras.layers.concatenate([encoder_output, encoder_output_], axis=2)
+        print(concat_around.shape, concat_around[:, 0, :].shape)
+        state = self.lstm_diff_.get_initial_state(batch_size=tf.shape(inputs)[0], dtype=tf.float32)
+        state1 = self.lstm_all_.get_initial_state(batch_size=tf.shape(inputs)[0], dtype=tf.float32)
+        pam_att_scores, vpl_att_scores = [], []
+        
+        for i in range(self.pre_k):
+
+            concat_ = tf.reshape(concat_around[:, i, :], shape=[-1, 1, concat_around[:, i, :].shape[-1]])
+            attention_output, attention_scores1 = self.MHAttention(concat_, concat_  #self.attention #self.MHA
+                                                                    , return_attention_scores=True)
+            pam_att_scores.append(attention_scores1)
+            attention_output = tf.reshape(attention_output
+                                          , shape=(-1, attention_output.shape[-1] * attention_output.shape[-2]))
+            contanct_val = keras.layers.concatenate([concat_around[:, i, :], attention_output], axis=1)
+            attention_output = self.layernorm1(contanct_val)
+            attention_output = self.dense_(attention_output)
+            
+            contanct_values = keras.layers.concatenate([encoder_output[:,i,:], attention_output], axis=1) # encoder_output[:,i,:], attention_output
+            
+            if i < 1:
+                diff_output, states_diff = self.lstm_diff_(input_diff[:,i,:], states=state)
+                end_output, states_all = self.lstm_all_(contanct_values, states=state1)
+            else:
+                diff_output, states_diff = self.lstm_diff_(input_diff[:,i,:], states=states_diff)
+                concat_h = keras.layers.concatenate([states_all[0], states_diff[0]], axis=1) 
+                concat_h = self.dense_diff(concat_h)
+                attention_output_diff, attention_scores_diff = self.attention_diff([concat_h, concat_h]
+                                                                    , return_attention_scores=True)
+                vpl_att_scores.append(attention_scores_diff)
+                attention_output_diff = tf.reshape(attention_output_diff, shape=[-1, attention_output_diff.shape[-1]]) 
+                h_all = self.layernorm3(concat_h + attention_output_diff) 
+                h_all = self.dense_h_all(h_all)
+                h_all = keras.layers.concatenate([h_all, concat_h], axis=1) 
+                
+                end_output, states_all = self.lstm_all_(contanct_values, states=[h_all, states_all[1]]) 
+
+            self.logits[i] = tf.reshape(end_output, shape=[-1, 1, end_output.shape[-1]])
+            self.logits_[i] = tf.reshape(diff_output, shape=[-1, 1, diff_output.shape[-1]])
+            
+            
+        end_output = keras.layers.concatenate([self.logits[t] for t in range(self.pre_k)], axis=1)
+        diff_output = keras.layers.concatenate([self.logits_[t] for t in range(self.pre_k)], axis=1)
+        
+        return end_output, diff_output, states_all, states_diff, [pam_att_scores, vpl_att_scores]
+
+        
+class Decoder(keras.models.Model):
+    def __init__(self, units = 128, label = 1, pre_k=None):
+        """ units: Lstm 输出维度; label:最后输出的结果的维度 """
+        super().__init__()
+        self.Dense = {}
+        self.Dense1 = {}
+        self.pre_k, self.units, self.label = pre_k, units, label
+        self.dense0 = keras.layers.Dense(units)
+        self.dense1 = keras.layers.Dense(units)
+        self.dense2 = keras.layers.Dense(units)
+
+        self.lstm_all = keras.layers.LSTMCell(128#, return_state=True # , return_sequences=True
+                                        , activity_regularizer=tf.keras.regularizers.l2(0.001) 
+                                        , kernel_regularizer=tf.keras.regularizers.l2(0.001) 
+                                        # , activation = 'relu'
+                                        )
+        self.lstm_diff = keras.layers.LSTMCell(128#, return_state=True # , return_sequences=True
+                                        , activity_regularizer=tf.keras.regularizers.l2(0.001)
+                                        , kernel_regularizer=tf.keras.regularizers.l2(0.001) 
+                                        )
+        for i in range(self.pre_k):
+            self.Dense[i] = keras.layers.Dense(label)
+            self.Dense1[i] = keras.layers.Dense(label)
+        self.attention3 = keras.layers.Attention()
+        self.Dense0 = keras.layers.Dense(label)
+        self.layernorm2 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+            
+    def call(self, inputs_decoder, end_output, diff_output, states_all, states_diff, input_diff):
+
+        # mlp_outputs = self.dense0(inputs_decoder)
+        # inputs = mlp_outputs
+        all_input = inputs_decoder[:, 0, :]
+        contanct_output = keras.layers.concatenate([end_output, diff_output], axis=1)
+        gam_att_scores = []
+        for i in range(self.pre_k):
+            
+            if i < 1:
+                decoder_output, state_h2 = self.lstm_all(all_input, states=[end_output[:,-1,:], states_all[1]])
+                
+            else:
+                decoder_output, state_h2 = self.lstm_all(all_input, states=state_h2)
+
+            decoder_output = tf.reshape(decoder_output, shape=[-1, 1, decoder_output.shape[1]])
+            attention_output, attention_scores = self.attention3([decoder_output, contanct_output] #end_output,contanct_output
+                                                             , return_attention_scores=True)
+            gam_att_scores.append(attention_scores)
+            attention_output = self.dense1(attention_output)
+            contanct_input = keras.layers.concatenate([attention_output, decoder_output], axis=2)            
+            contanct_input = tf.reshape(contanct_input, shape=[-1, contanct_input.shape[-1]])
+            if i < 1:
+                output1_x = self.Dense[i](contanct_input)
+                output1_y = self.Dense1[i](contanct_input)
+                output1 = keras.layers.concatenate([output1_x, output1_y], axis=1)
+                output1 = tf.reshape(output1, shape=[-1, output1.shape[-1]])
+                eorr = output1 # - train_y[:,:, 2*i:2*i+1]
+                all_input = eorr
+            else:
+                output_x = self.Dense[i](contanct_input)
+                output_y = self.Dense1[i](contanct_input)
+                output = keras.layers.concatenate([output_x, output_y], axis=1)
+                output = tf.reshape(output, shape=[-1, output.shape[-1]])
+                output1_x = keras.layers.concatenate([output1_x, output_x], axis=1)
+                output1_y = keras.layers.concatenate([output1_y, output_y], axis=1)
+                eorr = output # - train_y[:, :, 2*i:2*i+1]
+                all_input = eorr
+        return output1_x,  output1_y, gam_att_scores 
+
+time_step = 10
+pre_k = 10
+ndoe_ = 2
+input_size = 5
+output_size = 2 * pre_k
+epochs = 5000
+batch_size = 128 
+decoder_inputsize = 2 
+
+def TarjE2ENet(time_step, input_size, ndoe_, decoder_inputsize, pre_k):
+    # Input Layer
+    att_encoder_inputs = keras.layers.Input(shape=([time_step, input_size]), name='att_encode_input')
+    att_encoder_inputs_ = keras.layers.Input(shape=([time_step, input_size*(ndoe_-1)]), name='att_encode_input_')
+    diff_encoder_inputs = keras.layers.Input(shape=([time_step, input_size]), name='diff_encode_input')
+    decoder_inputs = keras.layers.Input(shape=([time_step, decoder_inputsize]), name="decode_input")
+    
+    # Encoder Layer
+    end_output, diff_output, states_all, states_diff, att_values = Trajectory_information_Encoder()(att_encoder_inputs
+                                                                           , att_encoder_inputs_
+                                                                           , diff_encoder_inputs)
+    # Decoder Layer
+    dense_outputs, dense_outputs1, gam_att_scores = Decoder(pre_k=pre_k)(decoder_inputs, end_output, diff_output
+                                         , states_all, states_diff, diff_encoder_inputs)
+    # our model
+    model = keras.models.Model(inputs=[decoder_inputs, att_encoder_inputs, att_encoder_inputs_
+                                       , diff_encoder_inputs], outputs=[dense_outputs, dense_outputs1])
+    return model
+
+decoder_input_x = pd.read_csv('G:/CN_AIS/featuer_OMinput_decoder_Nanjing.csv', index_col=0) 
+input_x = pd.read_csv('G:/CN_AIS/featuer_OMinput_Nanjing.csv', index_col=0)
+output_y = pd.read_csv('G:/CN_AIS/featuer_OMoutput_Nanjing.csv', index_col=0) 
+
+nan_index = input_x[input_x.isnull().T.any()].index
+input_x = input_x.loc[~input_x.index.isin(nan_index)]
+decoder_input_x = decoder_input_x.loc[~decoder_input_x.index.isin(nan_index)]
+output_y = output_y.loc[~output_y.index.isin(nan_index)]
+
+train_decoder_inputs = tf.reshape(decoder_input_x.values[:int(decoder_input_x.shape[0]*0.8), :]
+                      , shape=[decoder_input_x.values[:int(decoder_input_x.shape[0]*0.8), :].shape[0], time_step, 2])
+test_decoder_inputs = tf.reshape(decoder_input_x.values[int(decoder_input_x.shape[0]*0.8):, :]
+                    , shape=[decoder_input_x.values[int(decoder_input_x.shape[0]*0.8):, :].shape[0], time_step, 2])
+
+train_x = tf.reshape(input_x.values[:int(input_x.shape[0]*0.8), :]
+                      , shape=[input_x.values[:int(input_x.shape[0]*0.8), :].shape[0], time_step, input_size*(ndoe_+1)])
+train_encoder_inputs = train_x[:,:, 0:input_size]
+train_encoder_inputs_ = train_x[:,:, input_size:ndoe_*input_size]
+train_diff_encoder_inputs = train_x[:,:,(ndoe_)*input_size:] #ndoe_*input_size
+
+test_x = tf.reshape(input_x.values[int(input_x.shape[0]*0.8):, :]
+                    , shape=[input_x.values[int(input_x.shape[0]*0.8):, :].shape[0], time_step, input_size*(ndoe_+1)])
+test_encoder_inputs, test_encoder_inputs_ = test_x[:,:, 0:input_size], test_x[:,:, input_size:ndoe_*input_size]
+test_diff_encoder_inputs = test_x[:,:, ndoe_*input_size:] 
+
+train_y = output_y.values[:int(output_y.shape[0]*0.8), :].reshape(output_y.values[:int(output_y.shape[0]*0.8), :].shape[0], output_size)
+test_y = output_y.values[int(output_y.shape[0]*0.8):, :].reshape(output_y.values[int(output_y.shape[0]*0.8):, :].shape[0], output_size)
+y_train, y_test = train_y, test_y
+
+y_train_x, y_train_y = y_train[:,0:20:2], y_train[:,1:20:2]
+y_test_x, y_test_y = y_test[:,0:20:2], y_test[:,1:20:2]
+
+model = TarjE2ENet(time_step, input_size, ndoe_, decoder_inputsize, pre_k)
+model.summary()
+model.compile(loss = keras.losses.MeanSquaredError()
+              ,optimizer = keras.optimizers.Adam(learning_rate=0.0050) 
+              ,metrics=[keras.metrics.MeanAbsoluteError()]) 
+history = model.fit([train_decoder_inputs, train_encoder_inputs, train_encoder_inputs_, train_diff_encoder_inputs]
+                    , [y_train_x, y_train_y], epochs = epochs
+                                , batch_size = batch_size
+                                , validation_data=([test_decoder_inputs, test_encoder_inputs, test_encoder_inputs_
+                                                    , test_diff_encoder_inputs], [y_test_x, y_test_y]))
+
+plt.plot(history.history[list(history.history.keys())[1]], label='train')
+plt.plot(history.history[list(history.history.keys())[6]], label='test')
+plt.legend()
+plt.xlabel('Epochs', fontsize = 12)
+plt.ylabel('LOSS', fontsize = 12)
+plt.show()
+plt.plot(history.history[list(history.history.keys())[3]], label='train')
+plt.plot(history.history[list(history.history.keys())[8]], label='test')
+plt.legend()
+plt.xlabel('Epochs', fontsize = 12)
+plt.ylabel('MeanAbsoluteError', fontsize = 12)
+plt.show()
+plt.plot(history.history[list(history.history.keys())[2]], label='train')
+plt.plot(history.history[list(history.history.keys())[7]], label='test')
+plt.legend()
+plt.xlabel('Epochs', fontsize = 12)
+plt.ylabel('LOSS', fontsize = 12)
+plt.show()
+plt.plot(history.history[list(history.history.keys())[4]], label='train')
+plt.plot(history.history[list(history.history.keys())[9]], label='test')
+plt.legend()
+plt.xlabel('Epochs', fontsize = 12)
+plt.ylabel('MeanAbsoluteError', fontsize = 12)
+plt.show()
+
