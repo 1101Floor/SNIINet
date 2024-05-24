@@ -198,9 +198,9 @@ def TarjE2ENet(time_step, input_size, ndoe_, decoder_inputsize, pre_k):
                                        , diff_encoder_inputs], outputs=[dense_outputs, dense_outputs1])
     return model
 
-decoder_input_x = pd.read_csv('G:/CN_AIS/featuer_OMinput_decoder_Nanjing.csv', index_col=0) 
-input_x = pd.read_csv('G:/CN_AIS/featuer_OMinput_Nanjing.csv', index_col=0)
-output_y = pd.read_csv('G:/CN_AIS/featuer_OMoutput_Nanjing.csv', index_col=0) 
+decoder_input_x = pd.read_csv('input_decoder.csv', index_col=0) 
+input_x = pd.read_csv('input.csv', index_col=0)
+output_y = pd.read_csv('output.csv', index_col=0) 
 
 nan_index = input_x[input_x.isnull().T.any()].index
 input_x = input_x.loc[~input_x.index.isin(nan_index)]
