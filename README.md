@@ -1,1 +1,1 @@
-# TrajE2ENet
+# SNIINet
